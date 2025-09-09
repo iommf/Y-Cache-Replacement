@@ -1,5 +1,5 @@
 # Y-Cache-Replacement
-Trying to insert new cache replacement on YANFD
+Trying to insert new cache replacement on ndnd
 
 The code is in golang, but i write it in txt for my own purpose :)
 
