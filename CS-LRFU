@@ -1,0 +1,145 @@
+package table
+
+import (
+	"container/list"
+	"fmt"
+	"math"
+
+	"github.com/named-data/ndnd/fw/defn"
+)
+
+// CsLRFU is a Least Recently/Frequently Used replacement policy.
+type CsLRFU struct {
+	cs        PitCsTable
+	lambda    float64
+	count     uint
+	crf       map[uint64]float64
+	lastRef   map[uint64]uint
+	queue     *list.List
+	locations map[uint64]*list.Element
+}
+
+func NewCsLRFU(cs PitCsTable, lambda float64) *CsLRFU {
+	// Clamp lambda to [0.0, 1.0]
+	if lambda < 0.0 {
+		lambda = 0.0
+	} else if lambda > 1.0 {
+		lambda = 1.0
+	}
+
+	return &CsLRFU{
+		cs:        cs,
+		lambda:    lambda,
+		crf:       make(map[uint64]float64),
+		lastRef:   make(map[uint64]uint),
+		queue:     list.New(),
+		locations: make(map[uint64]*list.Element),
+	}
+}
+
+func (l *CsLRFU) getWeight(v uint) float64 {
+	return math.Pow(0.25, l.lambda*float64(v))
+}
+
+func (l *CsLRFU) getCRF(index uint64) float64 {
+	delta := l.count - l.lastRef[index]
+	crfValue := l.getWeight(delta) * l.crf[index]
+	fmt.Printf("[CsLRFU] getCRF: index=%d | delta=%d | weight=%.4f | crf=%.4f | finalCRF=%.4f\n",
+		index, delta, l.getWeight(delta), l.crf[index], crfValue)
+	return crfValue
+}
+
+func (l *CsLRFU) AfterInsert(index uint64, wire []byte, data *defn.FwData) {
+	l.count++
+	delta := (100 - (100 - l.count))
+	l.crf[index] = l.getWeight(delta)
+	l.lastRef[index] = l.count
+	l.locations[index] = l.queue.PushBack(index)
+	fmt.Printf("[CsLRFU] AfterInsert: Paket dengan index %d dimasukkan ke Content Store, CRF=%.4f\n", index, l.crf[index])
+}
+
+func (l *CsLRFU) AfterRefresh(index uint64, wire []byte, data *defn.FwData) {
+	l.count++
+	weight := l.getWeight(0)
+
+	if weight == 1.0 {
+		l.crf[index] = weight
+		fmt.Printf("[CsLRFU] AfterRefresh: CRF with index %d is being reset because of weight=1.0\n", index)
+	} else {
+		l.crf[index] = weight + l.getCRF(index)
+		fmt.Printf("[CsLRFU] AfterRefresh: CRF with index %d being updated to %.4f\n", index, l.crf[index])
+	}
+
+	l.lastRef[index] = l.count
+	if loc, ok := l.locations[index]; ok {
+		l.queue.Remove(loc)
+	}
+	l.locations[index] = l.queue.PushBack(index)
+}
+
+func (l *CsLRFU) BeforeErase(index uint64, wire []byte) {
+	if loc, ok := l.locations[index]; ok {
+		l.queue.Remove(loc)
+	}
+	delete(l.crf, index)
+	delete(l.lastRef, index)
+	delete(l.locations, index)
+	fmt.Printf("[CsLRFU] BeforeErase: Packet with index %d is deleted from Content Store\n", index)
+}
+
+func (l *CsLRFU) BeforeUse(index uint64, wire []byte) {
+	l.count++
+	weight := l.getWeight(0)
+
+	if weight == 1.0 {
+		l.crf[index] = weight
+		fmt.Printf("[CsLRFU] BeforeUse: CRF with index %d being reset because of weight=1.0\n", index)
+	} else {
+		l.crf[index] = weight + l.getCRF(index)
+		fmt.Printf("[CsLRFU] BeforeUse: CRF with index %d being updated to %.4f\n", index, l.crf[index])
+	}
+
+	l.lastRef[index] = l.count
+	if loc, ok := l.locations[index]; ok {
+		l.queue.Remove(loc)
+	}
+	l.locations[index] = l.queue.PushBack(index)
+	fmt.Printf("[CsLRFU] BeforeUse: Packet with index %d will be used\n", index)
+}
+
+func (l *CsLRFU) EvictEntries() {
+	for l.queue.Len() > CfgCsCapacity() {
+		var minCRF float64 = math.MaxFloat64
+		var targetIndex uint64
+		found := false
+
+		for e := l.queue.Front(); e != nil; e = e.Next() {
+			idx := e.Value.(uint64)
+			crfVal, ok := l.crf[idx]
+			if !ok {
+				continue
+			}
+
+			if !found || crfVal < minCRF {
+				minCRF = crfVal
+				targetIndex = idx
+				found = true
+			}
+		}
+
+		if !found {
+			fmt.Println("[CsLRFU] EvictEntries: There is no entry for eviction, exiting the loop")
+			break
+		}
+
+		fmt.Printf("[CsLRFU] EvictEntries: Delete the index %d dengan CRF=%.4f\n", targetIndex, minCRF)
+
+		if loc, ok := l.locations[targetIndex]; ok {
+			l.queue.Remove(loc)
+		}
+		delete(l.crf, targetIndex)
+		delete(l.lastRef, targetIndex)
+		delete(l.locations, targetIndex)
+		l.cs.eraseCsDataFromReplacementStrategy(targetIndex)
+	}
+}
