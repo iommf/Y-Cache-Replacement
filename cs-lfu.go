@@ -1,0 +1,152 @@
+package table
+
+import (
+	"container/list"
+	"fmt"
+
+	"github.com/named-data/ndnd/fw/defn"
+)
+
+type CsLFU struct {
+	cs          PitCsTable
+	freq        map[uint64]int
+	historyFreq map[uint64]int // untuk menyimpan riwayat frekuensi
+	queue       *list.List
+	locations   map[uint64]*list.Element
+	bucket      map[int]map[uint64]struct{} // frekuensi -> set index
+	maxPerFreq  int                         // batas jumlah index per frekuensi
+}
+
+func NewCsLFU(cs PitCsTable) *CsLFU {
+	l := new(CsLFU)
+	l.cs = cs
+	l.queue = list.New()
+	l.locations = make(map[uint64]*list.Element)
+	l.freq = make(map[uint64]int)
+	l.historyFreq = make(map[uint64]int)
+	l.bucket = make(map[int]map[uint64]struct{})
+	l.maxPerFreq = 900
+	return l
+}
+
+func (l *CsLFU) addToBucket(index uint64, freq int) {
+	if _, ok := l.bucket[freq]; !ok {
+		l.bucket[freq] = make(map[uint64]struct{})
+	}
+	l.bucket[freq][index] = struct{}{}
+}
+
+func (l *CsLFU) removeFromBucket(index uint64, freq int) {
+	if _, ok := l.bucket[freq]; ok {
+		delete(l.bucket[freq], index)
+		if len(l.bucket[freq]) == 0 {
+			delete(l.bucket, freq)
+		}
+	}
+}
+
+func (l *CsLFU) AfterInsert(index uint64, wire []byte, data *defn.FwData) {
+	fmt.Printf("[CsLFU] AfterInsert: Packet with index %d inserted to Content Store\n", index)
+
+	// Ambil frekuensi dari history jika ada
+	baseFreq := 1
+	if lastFreq, ok := l.historyFreq[index]; ok {
+		baseFreq = lastFreq + 1
+	}
+
+	// Bersihkan jika index masih ada
+	if oldFreq, ok := l.freq[index]; ok {
+		l.removeFromBucket(index, oldFreq)
+	}
+	if location, ok := l.locations[index]; ok {
+		l.queue.Remove(location)
+	}
+
+	l.freq[index] = baseFreq
+	l.historyFreq[index] = baseFreq
+	l.addToBucket(index, baseFreq)
+	l.locations[index] = l.queue.PushBack(index)
+}
+
+func (l *CsLFU) AfterRefresh(index uint64, wire []byte, data *defn.FwData) {
+	fmt.Printf("[CsLFU] AfterRefresh: Packet with index %d will be refreshed (reused)\n", index)
+	oldFreq := l.freq[index]
+	l.freq[index] = oldFreq + 1
+	l.historyFreq[index] = l.freq[index]
+	l.removeFromBucket(index, oldFreq)
+	l.addToBucket(index, oldFreq+1)
+	if location, ok := l.locations[index]; ok {
+		l.queue.Remove(location)
+	}
+	l.locations[index] = l.queue.PushBack(index)
+}
+
+func (l *CsLFU) BeforeUse(index uint64, wire []byte) {
+	fmt.Printf("[CsLFU] BeforeUse: Packet with index %d will be used\n", index)
+	oldFreq := l.freq[index]
+	l.freq[index] = oldFreq + 1
+	l.historyFreq[index] = l.freq[index]
+	l.removeFromBucket(index, oldFreq)
+	l.addToBucket(index, oldFreq+1)
+	if location, ok := l.locations[index]; ok {
+		l.queue.Remove(location)
+	}
+	l.locations[index] = l.queue.PushBack(index)
+}
+
+func (l *CsLFU) BeforeErase(index uint64, wire []byte) {
+	fmt.Printf("[CsLFU] BeforeErase: Packet with index %d will be deleted from Content Store\n", index)
+	if location, ok := l.locations[index]; ok {
+		l.queue.Remove(location)
+		delete(l.locations, index)
+	}
+	if freqVal, ok := l.freq[index]; ok {
+		l.removeFromBucket(index, freqVal)
+		delete(l.freq, index)
+	}
+	// Jangan hapus dari historyFreq agar frekuensinya tetap terjaga saat index masuk lagi
+}
+
+func (l *CsLFU) EvictEntries() {
+	for l.queue.Len() > CfgCsCapacity() {
+		minFreq := l.getMinFrequency()
+
+		if len(l.bucket[minFreq]) > l.maxPerFreq {
+			for indexToErase := range l.bucket[minFreq] {
+				fmt.Printf("[CsLFU] EvictEntries: Deleted the index %d (Frequency is already reaching the limit)\n", indexToErase, minFreq)
+				l.cs.eraseCsDataFromReplacementStrategy(indexToErase)
+				if loc, ok := l.locations[indexToErase]; ok {
+					l.queue.Remove(loc)
+					delete(l.locations, indexToErase)
+				}
+				l.removeFromBucket(indexToErase, minFreq)
+				delete(l.freq, indexToErase)
+				break
+			}
+		} else {
+			for e := l.queue.Front(); e != nil; e = e.Next() {
+				indexToErase := e.Value.(uint64)
+				if l.freq[indexToErase] == minFreq {
+					fmt.Printf("[CsLFU] EvictEntries: Deleted the index %d (eviction reguler)\n", indexToErase)
+					l.cs.eraseCsDataFromReplacementStrategy(indexToErase)
+					l.queue.Remove(e)
+					delete(l.locations, indexToErase)
+					l.removeFromBucket(indexToErase, minFreq)
+					delete(l.freq, indexToErase)
+					break
+				}
+			}
+		}
+	}
+}
+
+func (l *CsLFU) getMinFrequency() int {
+	minFreq := int(^uint(0) >> 1)
+	for freq := range l.bucket {
+		if len(l.bucket[freq]) > 0 && freq < minFreq {
+			minFreq = freq
+		}
+	}
+	return minFreq
+}
+
